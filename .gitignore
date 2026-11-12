@@ -1,0 +1,11 @@
+# Imagens e datasets usados no treinamento e teste da CNN
+/ia/dataset/
+/ia/dataset_real/
+/ia/resultados/
+
+# Modelos e arquivos gerados pelo treinamento
+/ia/modelos/
+
+# Cache e bytecode do Python
+__pycache__/
+*.py[cod]
