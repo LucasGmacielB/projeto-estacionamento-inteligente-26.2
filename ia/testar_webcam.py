@@ -8,7 +8,7 @@ RESULTADOS = BASE / "resultados"
 RESULTADOS.mkdir(exist_ok=True)
 
 # Webcam externa
-camera = cv2.VideoCapture(1)
+camera = cv2.VideoCapture(0)
 
 if not camera.isOpened():
     print("Erro ao abrir a webcam.")

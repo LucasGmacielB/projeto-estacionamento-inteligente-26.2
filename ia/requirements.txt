@@ -1,0 +1,9 @@
+tensorflow
+opencv-python
+numpy
+Pillow
+pyserial
+supabase
+python-dotenv
+matplotlib
+scikit-learn
