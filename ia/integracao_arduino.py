@@ -1,24 +1,52 @@
 
+import os
+import sys
 import time
-from datetime import datetime
+import re
+from pathlib import Path
+
+# CONFIGURACAO AUTOMATICA DO TCL/TK
+python_dir = Path(sys.base_prefix)
+
+tcl_dir = python_dir / "tcl" / "tcl8.6"
+tk_dir = python_dir / "tcl" / "tk8.6"
+
+if (tcl_dir / "init.tcl").exists():
+    os.environ["TCL_LIBRARY"] = str(tcl_dir)
+
+if (tk_dir / "tk.tcl").exists():
+    os.environ["TK_LIBRARY"] = str(tk_dir)
+
 import cv2
 import serial
 from serial.tools import list_ports
 
+from popup_pagamento import abrir_popup_pagamento
 from reconhecer_placa import reconhecer_placa
+
 from estacionamento import (
     entrada_veiculo,
     consultar_saida,
     finalizar_saida
 )
 
-# CONFIGURAÇÕES
+
+# CONFIGURACOES DO HARDWARE
+
 PORTA_ARDUINO = "COM14"
 VELOCIDADE = 9600
 CAMERA_ID = 0
 
-# Mantemos a confirmação manual na demonstração
-MODO_TESTE = True
+
+# CONFIGURACOES DO RECONHECIMENTO AUTOMATICO
+
+CONFIANCA_MINIMA = 0.90
+LEITURAS_NECESSARIAS = 5
+INTERVALO_LEITURAS = 0.5
+TEMPO_MAXIMO_RECONHECIMENTO = 30
+TEMPO_PREPARACAO_CAMERA = 2
+
+PERMITIR_CONFIRMACAO_MANUAL = True
 
 
 def listar_portas():
@@ -28,24 +56,86 @@ def listar_portas():
         print(f"  {porta.device} - {porta.description}")
 
 
-def capturar_placa():
+def validar_placa(placa):
+    placa = placa.strip().upper()
+
+    # Formato antigo: ABC1234
+    formato_antigo = r"[A-Z]{3}[0-9]{4}"
+
+    # Formato Mercosul: ABC1D23
+    formato_mercosul = r"[A-Z]{3}[0-9][A-Z][0-9]{2}"
+
+    return bool(
+        re.fullmatch(formato_antigo, placa)
+        or re.fullmatch(formato_mercosul, placa)
+    )
+
+
+def confirmar_placa(placa_ia=None):
+    if placa_ia:
+        print(f"\nÚltima placa reconhecida: {placa_ia}")
+
+    while True:
+        resposta = input(
+            "Digite a placa correta "
+            "(ENTER para aceitar a sugestão / C para cancelar): "
+        ).strip().upper()
+
+        if resposta == "C":
+            return None
+
+        placa = resposta or placa_ia
+
+        if placa and validar_placa(placa):
+            return placa
+
+        print("Formato de placa inválido.")
+
+
+def reconhecer_automaticamente():
     camera = cv2.VideoCapture(CAMERA_ID)
 
     if not camera.isOpened():
         print("ERRO: não foi possível abrir a webcam.")
+        camera.release()
         return None
 
     print("\nWebcam aberta.")
     print("Posicione a placa no retângulo.")
-    print("ESPAÇO: capturar | Q: cancelar")
+    print("Reconhecimento automático iniciado.")
+    print("Pressione Q para cancelar.")
 
-    imagem = None
+    placa_anterior = None
+    ultima_placa = None
+    placa_validada = None
+
+    confianca_atual = 0.0
+    leituras_consecutivas = 0
+
+    inicio = time.monotonic()
+    ultima_leitura = inicio
+    cancelado = False
 
     try:
-        cv2.namedWindow("Reconhecimento", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Reconhecimento", 900, 600)
+        cv2.namedWindow(
+            "Reconhecimento Automatico",
+            cv2.WINDOW_NORMAL
+        )
+
+        cv2.resizeWindow(
+            "Reconhecimento Automatico",
+            900,
+            600
+        )
 
         while True:
+            agora = time.monotonic()
+            tempo_decorrido = agora - inicio
+
+            if tempo_decorrido >= TEMPO_MAXIMO_RECONHECIMENTO:
+                print("\nTempo máximo de reconhecimento atingido.")
+                break
+
             ok, frame = camera.read()
 
             if not ok:
@@ -56,11 +146,13 @@ def capturar_placa():
 
             x1 = int(largura * 0.15)
             x2 = int(largura * 0.85)
+
             y1 = int(altura * 0.35)
             y2 = int(altura * 0.65)
 
             tela = frame.copy()
 
+            # Retangulo de posicionamento
             cv2.rectangle(
                 tela,
                 (x1, y1),
@@ -69,65 +161,170 @@ def capturar_placa():
                 2
             )
 
+            # Aguarda a estabilizacao da camera
+            if tempo_decorrido >= TEMPO_PREPARACAO_CAMERA:
+
+                # Realiza reconhecimento em intervalos
+                if agora - ultima_leitura >= INTERVALO_LEITURAS:
+
+                    ultima_leitura = agora
+
+                    imagem = frame[y1:y2, x1:x2].copy()
+
+                    try:
+                        resultado = reconhecer_placa(imagem)
+
+                        if resultado["sucesso"]:
+
+                            placa = resultado["placa"].strip().upper()
+
+                            confianca = float(
+                                resultado["confianca"]
+                            )
+
+                            ultima_placa = placa
+                            confianca_atual = confianca
+
+                            if (
+                                confianca >= CONFIANCA_MINIMA
+                                and validar_placa(placa)
+                            ):
+
+                                if placa == placa_anterior:
+                                    leituras_consecutivas += 1
+
+                                else:
+                                    placa_anterior = placa
+                                    leituras_consecutivas = 1
+
+                                print(
+                                    f"[IA] Placa: {placa} | "
+                                    f"Confiança: {confianca:.2%} | "
+                                    f"Validação: "
+                                    f"{leituras_consecutivas}/"
+                                    f"{LEITURAS_NECESSARIAS}"
+                                )
+
+                                if (
+                                    leituras_consecutivas
+                                    >= LEITURAS_NECESSARIAS
+                                ):
+                                    placa_validada = placa
+
+                            else:
+                                placa_anterior = None
+                                leituras_consecutivas = 0
+
+                                print(
+                                    f"[IA] Leitura não validada: "
+                                    f"{placa} | {confianca:.2%}"
+                                )
+
+                        else:
+                            placa_anterior = None
+                            leituras_consecutivas = 0
+
+                    except Exception as erro:
+                        placa_anterior = None
+                        leituras_consecutivas = 0
+
+                        print(f"[IA] Erro na leitura: {erro}")
+
+            # INFORMACOES NA TELA
+
+            tempo_restante = max(
+                0,
+                int(
+                    TEMPO_MAXIMO_RECONHECIMENTO
+                    - tempo_decorrido
+                )
+            )
+
             cv2.putText(
                 tela,
-                "ESPACO: capturar | Q: cancelar",
+                "RECONHECIMENTO AUTOMATICO",
                 (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                tela,
+                f"Placa: {ultima_placa or 'Aguardando...'}",
+                (15, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                tela,
+                f"Confianca: {confianca_atual:.1%}",
+                (15, 95),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                tela,
+                f"Validacao: {leituras_consecutivas}/"
+                f"{LEITURAS_NECESSARIAS}",
+                (15, altura - 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (0, 255, 0),
                 2
             )
 
-            cv2.imshow("Reconhecimento", tela)
+            cv2.putText(
+                tela,
+                f"Tempo: {tempo_restante}s | Q: cancelar",
+                (15, altura - 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2
+            )
 
-            tecla = cv2.waitKeyEx(30)
+            cv2.imshow(
+                "Reconhecimento Automatico",
+                tela
+            )
+
+            tecla = cv2.waitKeyEx(1)
 
             if tecla in (ord("q"), ord("Q"), 27):
-                print("Captura cancelada.")
+                print("Reconhecimento cancelado.")
+                cancelado = True
                 break
 
-            if tecla == 32:
-                imagem = frame[y1:y2, x1:x2].copy()
-                print("Imagem capturada!")
+            if placa_validada:
+                print("\nPLACA VALIDADA AUTOMATICAMENTE!")
+                print(f"Placa: {placa_validada}")
+                print(f"Confiança: {confianca_atual:.2%}")
                 break
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
 
-    return imagem
+    if cancelado:
+        return None
 
+    if placa_validada:
+        return placa_validada
 
-def confirmar_placa(placa_ia):
-    print(f"\nPlaca reconhecida pela IA: {placa_ia}")
+    # Alternativa manual em caso de falha
+    if PERMITIR_CONFIRMACAO_MANUAL:
+        print("\nNão foi possível validar automaticamente.")
+        return confirmar_placa(ultima_placa)
 
-    while True:
-        resposta = input(
-            "Confirme a placa ou digite a correção "
-            "(ENTER para aceitar / C para cancelar): "
-        ).strip().upper()
-
-        if resposta == "C":
-            return None
-
-        placa = resposta if resposta else placa_ia
-
-        if len(placa) == 7 and placa.isalnum():
-            return placa
-
-        print("Placa inválida. Digite 7 letras/números.")
-
-
-def confirmar(mensagem):
-    if not MODO_TESTE:
-        return False
-
-    resposta = input(
-        f"\n{mensagem} (s/n): "
-    ).strip().lower()
-
-    return resposta == "s"
+    return None
 
 
 def enviar_abertura(arduino, sentido):
@@ -139,112 +336,92 @@ def enviar_abertura(arduino, sentido):
     print(f"Comando enviado: {comando.strip()}")
 
 
-def mostrar_cobranca(consulta):
-    entrada = consulta["entrada"].astimezone()
-    saida = consulta["saida"].astimezone()
-
-    print("\n" + "=" * 40)
-    print("RESUMO DO ESTACIONAMENTO")
-    print("=" * 40)
-
-    print(f"Placa: {consulta['placa']}")
-    print(f"Entrada: {entrada:%d/%m/%Y %H:%M:%S}")
-    print(f"Saída: {saida:%d/%m/%Y %H:%M:%S}")
-    print(
-        f"Minutos cobrados: "
-        f"{consulta['minutos_cobrados']}"
-    )
-    print(f"Valor a pagar: R$ {consulta['valor']:.2f}")
-
-    print("=" * 40)
-
-
 def processar_entrada(arduino, placa):
+    print("\n" + "=" * 40)
+    print("REGISTRO AUTOMATICO DE ENTRADA")
+    print("=" * 40)
+
     try:
         registro = entrada_veiculo(placa)
 
     except Exception as erro:
-        print(f"Não foi possível registrar entrada: {erro}")
+        print(f"Erro ao registrar entrada: {erro}")
         return
 
-    print("\nEntrada registrada no Supabase!")
+    print("\nENTRADA REGISTRADA COM SUCESSO!")
     print(f"Placa: {registro['placa']}")
     print(f"Horário: {registro['entrada']}")
 
-    if confirmar("Abrir cancela de ENTRADA?"):
+    # Abertura automatica sem confirmacao manual
+    try:
         enviar_abertura(arduino, "ENTRADA")
-    else:
+
+    except Exception as erro:
+        print(f"Erro ao enviar comando: {erro}")
         print(
-            "Abertura cancelada. "
-            "ATENÇÃO: a entrada já foi registrada no banco."
+            "ATENÇÃO: entrada registrada no banco, "
+            "mas abertura não confirmada."
         )
 
 
 def processar_saida(arduino, placa):
+    print("\n" + "=" * 40)
+    print("REGISTRO AUTOMATICO DE SAIDA")
+    print("=" * 40)
+
     try:
         consulta = consultar_saida(placa)
 
-    except Exception as erro:
-        print(f"Não foi possível consultar saída: {erro}")
-        return
+        # Exibe automaticamente o popup de pagamento
+        metodo = abrir_popup_pagamento(consulta)
 
-    mostrar_cobranca(consulta)
+        if metodo is None:
+            print("Pagamento cancelado.")
+            print("Veículo permanece estacionado.")
+            return
 
-    if not confirmar(
-        "Confirmar cobrança e liberar saída?"
-    ):
-        print("Saída cancelada. Registro continua ativo.")
-        return
-
-    try:
-        # Atualiza a cobrança usando o horário atual.
-        consulta = consultar_saida(placa)
-
+        # Mantem o valor exibido no popup
         registro = finalizar_saida(consulta)
 
     except Exception as erro:
-        print(f"Não foi possível finalizar saída: {erro}")
+        print(f"Erro ao processar saída: {erro}")
         return
 
-    print("\nSaída registrada no Supabase!")
-    print(f"Valor final: R$ {float(registro['valor']):.2f}")
+    print("\n" + "=" * 40)
+    print("PAGAMENTO SIMULADO CONFIRMADO")
+    print("=" * 40)
 
-    enviar_abertura(arduino, "SAIDA")
+    print(f"Placa: {registro['placa']}")
+    print(f"Pagamento: {metodo.upper()}")
+    print(f"Minutos cobrados: {consulta['minutos_cobrados']}")
+    print(f"Valor: R$ {float(registro['valor']):.2f}")
+    print(f"Status: {registro['status']}")
+
+    # Abertura automatica apos pagamento
+    try:
+        enviar_abertura(arduino, "SAIDA")
+
+    except Exception as erro:
+        print(f"Erro ao enviar comando: {erro}")
+        print(
+            "ATENÇÃO: saída finalizada no banco, "
+            "mas abertura não confirmada."
+        )
 
 
 def processar_veiculo(arduino, sentido):
-    print(f"\n{'=' * 40}")
+    print("\n" + "=" * 40)
     print(f"VEÍCULO DETECTADO: {sentido}")
-    print(f"{'=' * 40}")
+    print("=" * 40)
 
-    imagem = capturar_placa()
-
-    if imagem is None:
-        print("Nenhuma imagem capturada.")
-        return
-
-    try:
-        resultado = reconhecer_placa(imagem)
-
-    except Exception as erro:
-        print(f"Erro no reconhecimento: {erro}")
-        return
-
-    print("\nRESULTADO DA IA:")
-    print(resultado)
-
-    if not resultado["sucesso"]:
-        print("Reconhecimento não realizado.")
-        return
-
-    placa = confirmar_placa(resultado["placa"])
+    # Reconhecimento sem interacao manual
+    placa = reconhecer_automaticamente()
 
     if placa is None:
-        print("Operação cancelada.")
+        print("Operação cancelada ou placa não identificada.")
         return
 
-    print(f"\nPlaca confirmada: {placa}")
-    print(f"Confiança da IA: {resultado['confianca']}")
+    print(f"\nPlaca identificada: {placa}")
 
     if sentido == "ENTRADA":
         processar_entrada(arduino, placa)
@@ -256,7 +433,10 @@ def processar_veiculo(arduino, sentido):
 def main():
     listar_portas()
 
-    print(f"\nConectando ao Arduino em {PORTA_ARDUINO}...")
+    print(
+        f"\nConectando ao Arduino em "
+        f"{PORTA_ARDUINO}..."
+    )
 
     try:
         arduino = serial.Serial(
@@ -271,7 +451,12 @@ def main():
 
     time.sleep(2)
 
-    print("\nConectado ao Arduino!")
+    print("\n" + "=" * 40)
+    print("ESTACIONAMENTO INTELIGENTE")
+    print("MODO AUTOMATICO")
+    print("=" * 40)
+
+    print("Conectado ao Arduino!")
     print("Aguardando detecção de veículos...")
     print("CTRL+C para encerrar.\n")
 
@@ -290,10 +475,11 @@ def main():
             if not linha:
                 continue
 
-            print(f"[ARDUINO] {linha}")
-
+            # Ignora mensagens de debug
             if linha.startswith("#"):
                 continue
+
+            print(f"[ARDUINO] {linha}")
 
             if linha.startswith("SENSOR_LIVRE:"):
                 sentido = linha.split(":", 1)[1]
@@ -319,8 +505,30 @@ def main():
             elif linha.startswith("ERRO_SENSOR:"):
                 print("ATENÇÃO: falha em um sensor.")
 
+            elif linha.startswith("ERRO_SERVO:"):
+                print("ATENÇÃO: falha na configuração do servo.")
+
+            elif linha.startswith("CANCELA_ABERTA:"):
+                sentido = linha.split(":", 1)[1]
+
+                print(
+                    f"Arduino informou abertura "
+                    f"da cancela de {sentido}."
+                )
+
+            elif linha.startswith("CANCELA_FECHADA:"):
+                sentido = linha.split(":", 1)[1]
+
+                print(
+                    f"Arduino informou fechamento "
+                    f"da cancela de {sentido}."
+                )
+
     except KeyboardInterrupt:
         print("\nIntegração encerrada.")
+
+    except serial.SerialException as erro:
+        print(f"\nErro na comunicação serial: {erro}")
 
     finally:
         arduino.close()
